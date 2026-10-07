@@ -194,7 +194,7 @@ with st.sidebar:
     rango = st.select_slider("Rango del plano (±)", options=[5, 10, 20, 50], value=10)
     n_puntos = st.slider("Número de puntos de la trayectoria", 5, 40, 15)
     stroke_width = st.slider("Ancho de línea", 1, 30, 4)
-    modelo = st.text_input("Modelo", "gpt-4o-mini")
+    modelo = st.text_input("Modelo", "gpt-6-luna") #gpt-40-mini
 
 st.subheader("Dibuja la trayectoria (de un solo trazo) y presiona el botón")
 
