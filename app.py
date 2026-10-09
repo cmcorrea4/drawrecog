@@ -19,6 +19,9 @@ COLOR_INICIO = (0, 170, 0)  # marca verde del punto de partida
 MODO_TRAYECTORIA = "Trayectoria (vector de puntos)"
 MODO_ANGULOS = "Trayectoria + ángulos (3 líneas)"
 
+# Articulación de cada línea (en orden de trazo) y su límite simétrico en grados
+ARTICULACIONES = [("Hombro", 100), ("Codo", 140), ("Muñeca", 110)]
+
 
 # ---------------------------------------------------------------------------
 # Plano cartesiano de referencia
@@ -195,26 +198,27 @@ def validar_puntos(contenido, rango):
 def calcular_angulos(puntos):
     """Ángulos (en grados) de una línea quebrada de 3 segmentos: P0-P1-P2-P3.
 
-    - Ángulo 1: inclinación de la línea 1 respecto a la horizontal (eje X positivo),
-      medido en sentido antihorario en P0.
-    - Ángulo 2: ángulo interior entre la línea 1 y la línea 2, en el vértice P1.
-    - Ángulo 3: ángulo interior entre la línea 2 y la línea 3, en el vértice P2.
+    El ángulo k es la inclinación de la línea k respecto a la horizontal
+    (eje X positivo), siguiendo el sentido en que se dibujó el trazo.
+    Positivo = antihorario (la línea sube), negativo = horario (la línea baja).
+    Rango: (-180°, 180°].
     """
     if len(puntos) != 4:
         raise ValueError(f"Se necesitan 4 vértices para 3 líneas y llegaron {len(puntos)}.")
-    p0, p1, p2, p3 = (np.array(p, dtype=float) for p in puntos)
-    v1, v2, v3 = p1 - p0, p2 - p1, p3 - p2
-    if min(np.linalg.norm(v) for v in (v1, v2, v3)) == 0:
+    p = np.array(puntos, dtype=float)
+    segmentos = np.diff(p, axis=0)  # v1, v2, v3
+    if np.any(np.linalg.norm(segmentos, axis=1) == 0):
         raise ValueError("Hay dos vértices repetidos; no se pueden calcular los ángulos.")
+    angulos = np.degrees(np.arctan2(segmentos[:, 1], segmentos[:, 0]))
+    return [round(float(a) + 0.0, 1) for a in angulos]  # + 0.0 evita mostrar "-0.0"
 
-    def interior(a, b):
-        cos = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-        return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
 
-    angulo_1 = float(np.degrees(np.arctan2(v1[1], v1[0])))
-    angulo_2 = interior(-v1, v2)
-    angulo_3 = interior(-v2, v3)
-    return [round(angulo_1, 1), round(angulo_2, 1), round(angulo_3, 1)]
+def limitar_angulos(angulos):
+    """Recorta cada ángulo al rango de su articulación (hombro, codo, muñeca)."""
+    return [
+        float(max(-limite, min(limite, a)))
+        for a, (_, limite) in zip(angulos, ARTICULACIONES)
+    ]
 
 
 def graficar_verificacion(img, puntos, lado, rango, angulos=None):
@@ -227,10 +231,10 @@ def graficar_verificacion(img, puntos, lado, rango, angulos=None):
     for i, (x, y) in enumerate(puntos):
         ax.annotate(str(i), (x, y), textcoords="offset points", xytext=(5, 5), fontsize=8)
     if angulos:
-        # El ángulo k se mide en el vértice k-1 (puntos 0, 1 y 2)
+        # El ángulo k se anota donde empieza la línea k (puntos 0, 1 y 2)
         for i, ang in enumerate(angulos):
             ax.annotate(
-                f"∠{i + 1} = {ang}°", puntos[i], textcoords="offset points", xytext=(8, -16),
+                f"{ARTICULACIONES[i][0]} = {ang}°", puntos[i], textcoords="offset points", xytext=(8, -16),
                 fontsize=9, color="#1F3A93", fontweight="bold",
                 bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "#1F3A93", "lw": 0.5},
             )
@@ -267,8 +271,10 @@ with st.sidebar:
 if modo_angulos:
     st.subheader("Dibuja las 3 líneas (de un solo trazo) y presiona el botón")
     st.caption(
-        "Empieza por el extremo donde va el ángulo 1: se mide entre la primera línea y la "
-        "horizontal. Los ángulos 2 y 3 son los que forman las líneas en cada esquina."
+        "La primera línea es el hombro, la segunda el codo y la tercera la muñeca. Cada "
+        "ángulo es la inclinación de su línea respecto a la horizontal, siguiendo el sentido "
+        "del trazo: positivo si sube, negativo si baja. Rangos: "
+        + ", ".join(f"{n.lower()} ±{lim}°" for n, lim in ARTICULACIONES) + "."
     )
 else:
     st.subheader("Dibuja la trayectoria (de un solo trazo) y presiona el botón")
@@ -314,9 +320,11 @@ if analyze_button:
                         "(los vértices de las 3 líneas). Intenta de nuevo."
                     )
                 else:
+                    medidos = calcular_angulos(puntos) if modo_angulos else None
                     st.session_state.trayectoria = {
                         "puntos": puntos, "imagen": img, "lado": lado, "rango": rango,
-                        "angulos": calcular_angulos(puntos) if modo_angulos else None,
+                        "angulos": limitar_angulos(medidos) if medidos else None,
+                        "angulos_medidos": medidos,
                     }
             except json.JSONDecodeError:
                 st.error("La respuesta del modelo no fue un JSON válido. Intenta de nuevo.")
@@ -327,7 +335,8 @@ if analyze_button:
 if "trayectoria" in st.session_state:
     t = st.session_state.trayectoria
     puntos = t["puntos"]      # <- este es el vector para el robot: [[x, y], ...]
-    angulos = t["angulos"]    # <- [ángulo 1, ángulo 2, ángulo 3] en grados, o None
+    angulos = t["angulos"]    # <- [hombro, codo, muñeca] en grados, ya limitados, o None
+    medidos = t.get("angulos_medidos") or angulos
     vector_json = json.dumps(puntos)
 
     st.subheader("Vector de trayectoria")
@@ -335,13 +344,21 @@ if "trayectoria" in st.session_state:
 
     if angulos:
         st.subheader("Ángulos")
-        descripciones = [
-            "Línea 1 respecto a la horizontal",
-            "Entre la línea 1 y la línea 2",
-            "Entre la línea 2 y la línea 3",
-        ]
+        st.caption("Medidos respecto a la horizontal (eje X positivo); antihorario es positivo.")
         for i, col in enumerate(st.columns(3)):
-            col.metric(f"Ángulo {i + 1}", f"{angulos[i]}°", help=descripciones[i])
+            nombre, limite = ARTICULACIONES[i]
+            col.metric(
+                nombre, f"{angulos[i]}°",
+                help=f"Inclinación de la línea {i + 1} respecto a la horizontal. "
+                     f"Rango permitido: -{limite}° a {limite}°.",
+            )
+            col.caption(f"Rango: -{limite}° a {limite}°")
+        for (nombre, limite), medido, limitado in zip(ARTICULACIONES, medidos, angulos):
+            if medido != limitado:
+                st.warning(
+                    f"{nombre}: se midió {medido}°, fuera del rango ±{limite}°. "
+                    f"Se limitó a {limitado}°."
+                )
         descarga = json.dumps({"puntos": puntos, "angulos": angulos})
     else:
         descarga = vector_json
