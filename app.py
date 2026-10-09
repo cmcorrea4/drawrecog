@@ -19,8 +19,10 @@ COLOR_INICIO = (0, 170, 0)  # marca verde del punto de partida
 MODO_TRAYECTORIA = "Trayectoria (vector de puntos)"
 MODO_ANGULOS = "Trayectoria + ángulos (3 líneas)"
 
-# Articulación de cada línea (en orden de trazo) y su límite simétrico en grados
+# Articulación de cada línea (en orden de trazo) y su límite simétrico en grados.
+# Nombres, claves y rangos son los del simulador "Brazo robótico 3D con control JSON y MQTT".
 ARTICULACIONES = [("Hombro", 100), ("Codo", 140), ("Muñeca", 110)]
+CLAVES_BRAZO = ["hombro", "codo", "muneca"]
 
 
 # ---------------------------------------------------------------------------
@@ -196,12 +198,14 @@ def validar_puntos(contenido, rango):
 # Ángulos de las 3 líneas
 # ---------------------------------------------------------------------------
 def calcular_angulos(puntos):
-    """Ángulos (en grados) de una línea quebrada de 3 segmentos: P0-P1-P2-P3.
+    """Ángulos articulares (en grados) de una línea quebrada de 3 segmentos: P0-P1-P2-P3.
 
-    El ángulo k es la inclinación de la línea k respecto a la horizontal
-    (eje X positivo), siguiendo el sentido en que se dibujó el trazo.
-    Positivo = antihorario (la línea sube), negativo = horario (la línea baja).
-    Rango: (-180°, 180°].
+    Usa la misma convención que el simulador del brazo visto en su vista lateral
+    (X del robot hacia la derecha, altura hacia arriba, base en 0°):
+    - Hombro: inclinación de la línea 1 respecto a la VERTICAL (0° = recto hacia arriba).
+    - Codo: giro de la línea 2 respecto a la prolongación de la línea 1 (0° = alineados).
+    - Muñeca: giro de la línea 3 respecto a la prolongación de la línea 2.
+    En los tres, positivo = sentido horario en el dibujo (hacia X+).
     """
     if len(puntos) != 4:
         raise ValueError(f"Se necesitan 4 vértices para 3 líneas y llegaron {len(puntos)}.")
@@ -209,8 +213,12 @@ def calcular_angulos(puntos):
     segmentos = np.diff(p, axis=0)  # v1, v2, v3
     if np.any(np.linalg.norm(segmentos, axis=1) == 0):
         raise ValueError("Hay dos vértices repetidos; no se pueden calcular los ángulos.")
-    angulos = np.degrees(np.arctan2(segmentos[:, 1], segmentos[:, 0]))
-    return [round(float(a) + 0.0, 1) for a in angulos]  # + 0.0 evita mostrar "-0.0"
+    # Ángulo de cada línea desde la vertical, positivo hacia X+
+    desde_vertical = np.degrees(np.arctan2(segmentos[:, 0], segmentos[:, 1]))
+    # Cada articulación gira respecto al eslabón anterior (el hombro, respecto a la vertical)
+    relativos = np.diff(desde_vertical, prepend=0.0)
+    relativos = (relativos + 180.0) % 360.0 - 180.0  # llevar a [-180°, 180°)
+    return [round(float(a) + 0.0, 1) for a in relativos]  # + 0.0 evita mostrar "-0.0"
 
 
 def limitar_angulos(angulos):
@@ -271,9 +279,9 @@ with st.sidebar:
 if modo_angulos:
     st.subheader("Dibuja las 3 líneas (de un solo trazo) y presiona el botón")
     st.caption(
-        "La primera línea es el hombro, la segunda el codo y la tercera la muñeca. Cada "
-        "ángulo es la inclinación de su línea respecto a la horizontal, siguiendo el sentido "
-        "del trazo: positivo si sube, negativo si baja. Rangos: "
+        "Dibuja el brazo como se ve en la vista lateral del simulador: empieza en el hombro "
+        "y traza brazo, antebrazo y pinza. El hombro se mide respecto a la vertical; el codo "
+        "y la muñeca, respecto al eslabón anterior. Positivo = sentido horario. Rangos: "
         + ", ".join(f"{n.lower()} ±{lim}°" for n, lim in ARTICULACIONES) + "."
     )
 else:
@@ -344,12 +352,17 @@ if "trayectoria" in st.session_state:
 
     if angulos:
         st.subheader("Ángulos")
-        st.caption("Medidos respecto a la horizontal (eje X positivo); antihorario es positivo.")
+        st.caption(
+            "Ángulos articulares del simulador en vista lateral: 0° en el hombro es el brazo "
+            "vertical; 0° en codo y muñeca es el eslabón alineado con el anterior. "
+            "Positivo = sentido horario (hacia X+)."
+        )
+        referencias = ["la vertical", "la línea 1 (brazo)", "la línea 2 (antebrazo)"]
         for i, col in enumerate(st.columns(3)):
             nombre, limite = ARTICULACIONES[i]
             col.metric(
                 nombre, f"{angulos[i]}°",
-                help=f"Inclinación de la línea {i + 1} respecto a la horizontal. "
+                help=f"Giro de la línea {i + 1} respecto a {referencias[i]}. "
                      f"Rango permitido: -{limite}° a {limite}°.",
             )
             col.caption(f"Rango: -{limite}° a {limite}°")
@@ -359,7 +372,10 @@ if "trayectoria" in st.session_state:
                     f"{nombre}: se midió {medido}°, fuera del rango ±{limite}°. "
                     f"Se limitó a {limitado}°."
                 )
-        descarga = json.dumps({"puntos": puntos, "angulos": angulos})
+        comando = dict(zip(CLAVES_BRAZO, angulos))
+        st.markdown("**Comando para el brazo** (pégalo en *Comando JSON* o publícalo en `<tópico>/cmd`)")
+        st.code(json.dumps(comando), language="json")
+        descarga = json.dumps({"puntos": puntos, "angulos": comando})
     else:
         descarga = vector_json
     st.download_button("Descargar JSON", descarga, "trayectoria.json", "application/json")
