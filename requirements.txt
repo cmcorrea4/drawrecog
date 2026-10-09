@@ -1,5 +1,5 @@
 streamlit
-streamlit-drawable-canvas
+streamlit-drawable-canvas== 0.9.2
 openai
 paho-mqtt
 numpy
