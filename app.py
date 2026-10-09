@@ -1,9 +1,13 @@
 import base64
 import io
 import json
+import threading
+import uuid
+from urllib.parse import urlparse
 
 import matplotlib.pyplot as plt
 import numpy as np
+import paho.mqtt.client as mqtt
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
@@ -23,6 +27,17 @@ MODO_ANGULOS = "Trayectoria + ángulos (3 líneas)"
 # Nombres, claves y rangos son los del simulador "Brazo robótico 3D con control JSON y MQTT".
 ARTICULACIONES = [("Hombro", 100), ("Codo", 140), ("Muñeca", 110)]
 CLAVES_BRAZO = ["hombro", "codo", "muneca"]
+
+# MQTT: valores por defecto (los mismos del simulador)
+BROKER_POR_DEFECTO = "wss://broker.emqx.io:8084/mqtt"
+TOPICO_POR_DEFECTO = "robotica/brazo1/cmd"
+# esquema de la URL -> (transporte de paho, usa TLS, puerto por defecto)
+ESQUEMAS_MQTT = {
+    "wss": ("websockets", True, 443),
+    "ws": ("websockets", False, 80),
+    "mqtts": ("tcp", True, 8883),
+    "mqtt": ("tcp", False, 1883),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +244,75 @@ def limitar_angulos(angulos):
     ]
 
 
+# ---------------------------------------------------------------------------
+# MQTT: envío del comando al brazo
+# ---------------------------------------------------------------------------
+def comando_brazo(angulos, base, giro, pinza, velocidad):
+    """Comando completo en el formato que entiende el brazo (mismo orden de claves)."""
+    hombro, codo, muneca = angulos
+    return {
+        "base": base, "hombro": hombro, "codo": codo, "muneca": muneca,
+        "giro": giro, "pinza": pinza, "velocidad": velocidad,
+    }
+
+
+def publicar_mqtt(broker_url, topico, carga, timeout=8):
+    """Publica `carga` (texto) en `topico` y espera la confirmación del broker.
+
+    `broker_url` puede ser wss://, ws://, mqtts:// o mqtt://, con puerto y ruta opcionales,
+    por ejemplo wss://broker.emqx.io:8084/mqtt. Lanza una excepción si algo falla.
+    """
+    u = urlparse(broker_url.strip())
+    if u.scheme not in ESQUEMAS_MQTT or not u.hostname:
+        raise ValueError(
+            "La dirección del broker debe empezar por wss://, ws://, mqtts:// o mqtt://, "
+            "por ejemplo " + BROKER_POR_DEFECTO
+        )
+    topico = topico.strip()
+    if not topico or "#" in topico or "+" in topico:
+        raise ValueError("Escribe un tópico válido, sin comodines (# o +).")
+    transporte, tls, puerto_defecto = ESQUEMAS_MQTT[u.scheme]
+
+    id_cliente = "tablero_" + uuid.uuid4().hex[:8]
+    try:  # paho-mqtt 2.x
+        cliente = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2, client_id=id_cliente, transport=transporte
+        )
+    except AttributeError:  # paho-mqtt 1.x
+        cliente = mqtt.Client(client_id=id_cliente, transport=transporte)
+    if transporte == "websockets":
+        cliente.ws_set_options(path=u.path or "/mqtt")
+    if tls:
+        cliente.tls_set()
+    if u.username:
+        cliente.username_pw_set(u.username, u.password)
+    cliente.connect_timeout = timeout
+
+    conectado = threading.Event()
+    estado = {}
+
+    def al_conectar(_cliente, _datos, _flags, codigo, _props=None):
+        estado["fallo"] = codigo.is_failure if hasattr(codigo, "is_failure") else codigo != 0
+        estado["codigo"] = codigo
+        conectado.set()
+
+    cliente.on_connect = al_conectar
+    cliente.connect(u.hostname, u.port or puerto_defecto, keepalive=30)
+    cliente.loop_start()
+    try:
+        if not conectado.wait(timeout):
+            raise TimeoutError("El broker no respondió a tiempo.")
+        if estado["fallo"]:
+            raise ConnectionError(f"El broker rechazó la conexión ({estado['codigo']}).")
+        info = cliente.publish(topico, carga, qos=1)
+        info.wait_for_publish(timeout)
+        if not info.is_published():
+            raise TimeoutError("El broker no confirmó el mensaje a tiempo.")
+    finally:
+        cliente.disconnect()
+        cliente.loop_stop()
+
+
 def graficar_verificacion(img, puntos, lado, rango, angulos=None):
     """Superpone los puntos del LLM sobre el dibujo original para comprobarlos."""
     limite = (lado / 2) / ((lado / 2 - MARGEN) / rango)
@@ -372,10 +456,32 @@ if "trayectoria" in st.session_state:
                     f"{nombre}: se midió {medido}°, fuera del rango ±{limite}°. "
                     f"Se limitó a {limitado}°."
                 )
-        comando = dict(zip(CLAVES_BRAZO, angulos))
-        st.markdown("**Comando para el brazo** (pégalo en *Comando JSON* o publícalo en `<tópico>/cmd`)")
-        st.code(json.dumps(comando), language="json")
-        descarga = json.dumps({"puntos": puntos, "angulos": comando})
+
+        st.subheader("Enviar al brazo por MQTT")
+        c1, c2 = st.columns(2)
+        broker_url = c1.text_input("Broker", BROKER_POR_DEFECTO)
+        topico = c2.text_input("Tópico", TOPICO_POR_DEFECTO)
+        st.caption(
+            "Hombro, codo y muñeca salen del dibujo. El resto del comando se ajusta aquí; "
+            "deja la base en 0° para que la vista lateral del simulador coincida con el dibujo."
+        )
+        c1, c2, c3, c4 = st.columns(4)
+        base = c1.number_input("Base (°)", -180, 180, 0)
+        giro = c2.number_input("Giro de pinza (°)", -180, 180, 0)
+        pinza = c3.number_input("Pinza (%)", 0, 100, 50)
+        velocidad = c4.number_input("Velocidad (%)", 1, 100, 50)
+
+        comando = comando_brazo(angulos, base, giro, pinza, velocidad)
+        comando_json = json.dumps(comando, indent=2)
+        st.code(comando_json, language="json")
+        if st.button("Enviar por MQTT", type="primary"):
+            try:
+                with st.spinner("Enviando ..."):
+                    publicar_mqtt(broker_url, topico, json.dumps(comando))
+                st.success(f"Comando publicado en {topico.strip()}")
+            except Exception as e:
+                st.error(f"No se pudo enviar el comando: {e}")
+        descarga = json.dumps({"puntos": puntos, "angulos": dict(zip(CLAVES_BRAZO, angulos))})
     else:
         descarga = vector_json
     st.download_button("Descargar JSON", descarga, "trayectoria.json", "application/json")
