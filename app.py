@@ -16,6 +16,9 @@ COLOR_EJES = "#1F3A93"
 COLOR_GRILLA = "#D9D9D9"
 COLOR_INICIO = (0, 170, 0)  # marca verde del punto de partida
 
+MODO_TRAYECTORIA = "Trayectoria (vector de puntos)"
+MODO_ANGULOS = "Trayectoria + ángulos (3 líneas)"
+
 
 # ---------------------------------------------------------------------------
 # Plano cartesiano de referencia
@@ -105,7 +108,8 @@ def imagen_para_llm(image_data, inicio, lado):
 # ---------------------------------------------------------------------------
 # LLM: de la imagen al vector de puntos
 # ---------------------------------------------------------------------------
-def construir_prompt(rango, n_puntos):
+def descripcion_plano(rango):
+    """Parte del prompt común a los dos modos: cómo leer la imagen."""
     paso = paso_grilla(rango)
     return f"""Eres el módulo de visión que planifica la trayectoria de un robot.
 
@@ -114,7 +118,15 @@ La imagen contiene un plano cartesiano de referencia:
 - X crece hacia la derecha y Y crece hacia arriba.
 - Ambos ejes van de -{rango} a {rango}. Hay una línea gris de cuadrícula cada {paso} unidad(es), con su valor numérico escrito junto a los ejes.
 
-El trazo ROJO es la trayectoria que dibujó el usuario. El círculo VERDE marca el punto donde empieza.
+El trazo ROJO es la trayectoria que dibujó el usuario. El círculo VERDE marca el punto donde empieza."""
+
+
+FORMATO_RESPUESTA = """Responde únicamente con un objeto JSON con esta forma, sin texto adicional:
+{"puntos": [[x1, y1], [x2, y2], ...]}"""
+
+
+def construir_prompt(rango, n_puntos):
+    return f"""{descripcion_plano(rango)}
 
 Tarea: devuelve exactamente {n_puntos} puntos (x, y) que describan la trayectoria.
 - Ordénalos desde el inicio (círculo verde) hasta el final del trazo.
@@ -122,11 +134,26 @@ Tarea: devuelve exactamente {n_puntos} puntos (x, y) que describan la trayectori
 - Lee cada coordenada apoyándote en la cuadrícula y las etiquetas, con un decimal.
 - Si hay varios trazos separados, recórrelos uno tras otro empezando por el que tiene el círculo verde.
 
-Responde únicamente con un objeto JSON con esta forma, sin texto adicional:
-{{"puntos": [[x1, y1], [x2, y2], ...]}}"""
+{FORMATO_RESPUESTA}"""
 
 
-def pedir_trayectoria(client, modelo, img, rango, n_puntos):
+def construir_prompt_vertices(rango):
+    """Modo ángulos: el trazo son 3 líneas rectas, así que bastan sus 4 vértices."""
+    return f"""{descripcion_plano(rango)}
+
+El trazo es una línea quebrada formada por exactamente 3 segmentos rectos conectados.
+Como fue dibujado a mano, los segmentos pueden verse algo irregulares: trátalos como rectas.
+
+Tarea: devuelve exactamente 4 puntos (x, y), que son los vértices de la línea quebrada.
+- Punto 1: el inicio del trazo (círculo verde).
+- Puntos 2 y 3: las dos esquinas donde el trazo cambia de dirección, en el orden en que se recorren.
+- Punto 4: el extremo final del trazo.
+- Lee cada coordenada apoyándote en la cuadrícula y las etiquetas, con un decimal.
+
+{FORMATO_RESPUESTA}"""
+
+
+def pedir_trayectoria(client, modelo, img, prompt):
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
     b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
@@ -137,7 +164,7 @@ def pedir_trayectoria(client, modelo, img, rango, n_puntos):
         messages=[{
             "role": "user",
             "content": [
-                {"type": "text", "text": construir_prompt(rango, n_puntos)},
+                {"type": "text", "text": prompt},
                 {"type": "image_url",
                  "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}},
             ],
@@ -162,7 +189,35 @@ def validar_puntos(contenido, rango):
     return puntos
 
 
-def graficar_verificacion(img, puntos, lado, rango):
+# ---------------------------------------------------------------------------
+# Ángulos de las 3 líneas
+# ---------------------------------------------------------------------------
+def calcular_angulos(puntos):
+    """Ángulos (en grados) de una línea quebrada de 3 segmentos: P0-P1-P2-P3.
+
+    - Ángulo 1: inclinación de la línea 1 respecto a la horizontal (eje X positivo),
+      medido en sentido antihorario en P0.
+    - Ángulo 2: ángulo interior entre la línea 1 y la línea 2, en el vértice P1.
+    - Ángulo 3: ángulo interior entre la línea 2 y la línea 3, en el vértice P2.
+    """
+    if len(puntos) != 4:
+        raise ValueError(f"Se necesitan 4 vértices para 3 líneas y llegaron {len(puntos)}.")
+    p0, p1, p2, p3 = (np.array(p, dtype=float) for p in puntos)
+    v1, v2, v3 = p1 - p0, p2 - p1, p3 - p2
+    if min(np.linalg.norm(v) for v in (v1, v2, v3)) == 0:
+        raise ValueError("Hay dos vértices repetidos; no se pueden calcular los ángulos.")
+
+    def interior(a, b):
+        cos = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+        return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+
+    angulo_1 = float(np.degrees(np.arctan2(v1[1], v1[0])))
+    angulo_2 = interior(-v1, v2)
+    angulo_3 = interior(-v2, v3)
+    return [round(angulo_1, 1), round(angulo_2, 1), round(angulo_3, 1)]
+
+
+def graficar_verificacion(img, puntos, lado, rango, angulos=None):
     """Superpone los puntos del LLM sobre el dibujo original para comprobarlos."""
     limite = (lado / 2) / ((lado / 2 - MARGEN) / rango)
     fig, ax = plt.subplots(figsize=(6, 6))
@@ -171,6 +226,14 @@ def graficar_verificacion(img, puntos, lado, rango):
     ax.plot(xs, ys, "o--", color="black", markersize=5, linewidth=1)
     for i, (x, y) in enumerate(puntos):
         ax.annotate(str(i), (x, y), textcoords="offset points", xytext=(5, 5), fontsize=8)
+    if angulos:
+        # El ángulo k se mide en el vértice k-1 (puntos 0, 1 y 2)
+        for i, ang in enumerate(angulos):
+            ax.annotate(
+                f"∠{i + 1} = {ang}°", puntos[i], textcoords="offset points", xytext=(8, -16),
+                fontsize=9, color="#1F3A93", fontweight="bold",
+                bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "#1F3A93", "lw": 0.5},
+            )
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.set_title("Puntos del LLM (negro) sobre el trazo original (rojo)")
@@ -190,13 +253,25 @@ with st.sidebar:
         "y la convierte en un vector de puntos (x, y) para enviar al robot."
     )
     st.divider()
+    modo = st.selectbox("Modo", [MODO_TRAYECTORIA, MODO_ANGULOS])
+    modo_angulos = modo == MODO_ANGULOS
     lado = st.slider("Tamaño del canvas (px)", 400, 800, 600, 50)
     rango = st.select_slider("Rango del plano (±)", options=[5, 10, 20, 50], value=10)
-    n_puntos = st.slider("Número de puntos de la trayectoria", 5, 40, 15)
+    n_puntos = st.slider(
+        "Número de puntos de la trayectoria", 5, 40, 15, disabled=modo_angulos,
+        help="En el modo de ángulos se usan siempre los 4 vértices de las 3 líneas.",
+    )
     stroke_width = st.slider("Ancho de línea", 1, 30, 4)
     modelo = st.text_input("Modelo", "gpt-6-luna") #gpt-40-mini
 
-st.subheader("Dibuja la trayectoria (de un solo trazo) y presiona el botón")
+if modo_angulos:
+    st.subheader("Dibuja las 3 líneas (de un solo trazo) y presiona el botón")
+    st.caption(
+        "Empieza por el extremo donde va el ángulo 1: se mide entre la primera línea y la "
+        "horizontal. Los ángulos 2 y 3 son los que forman las líneas en cada esquina."
+    )
+else:
+    st.subheader("Dibuja la trayectoria (de un solo trazo) y presiona el botón")
 
 canvas_result = st_canvas(
     stroke_width=stroke_width,
@@ -210,7 +285,9 @@ canvas_result = st_canvas(
 )
 
 api_key = st.text_input("Ingresa tu Clave", type="password")
-analyze_button = st.button("Generar trayectoria", type="primary")
+analyze_button = st.button(
+    "Generar trayectoria y ángulos" if modo_angulos else "Generar trayectoria", type="primary"
+)
 
 if analyze_button:
     inicio = inicio_del_trazo(canvas_result.json_data)
@@ -223,14 +300,24 @@ if analyze_button:
             try:
                 img = imagen_para_llm(canvas_result.image_data, inicio, lado)
                 client = OpenAI(api_key=api_key)
-                contenido = pedir_trayectoria(client, modelo, img, rango, n_puntos)
+                prompt = (
+                    construir_prompt_vertices(rango) if modo_angulos
+                    else construir_prompt(rango, n_puntos)
+                )
+                contenido = pedir_trayectoria(client, modelo, img, prompt)
                 puntos = validar_puntos(contenido, rango)
-                if puntos:
+                if not puntos:
+                    st.error("El modelo no devolvió puntos. Intenta de nuevo.")
+                elif modo_angulos and len(puntos) != 4:
+                    st.error(
+                        f"El modelo devolvió {len(puntos)} puntos y se esperaban 4 "
+                        "(los vértices de las 3 líneas). Intenta de nuevo."
+                    )
+                else:
                     st.session_state.trayectoria = {
                         "puntos": puntos, "imagen": img, "lado": lado, "rango": rango,
+                        "angulos": calcular_angulos(puntos) if modo_angulos else None,
                     }
-                else:
-                    st.error("El modelo no devolvió puntos. Intenta de nuevo.")
             except json.JSONDecodeError:
                 st.error("La respuesta del modelo no fue un JSON válido. Intenta de nuevo.")
             except Exception as e:
@@ -239,15 +326,29 @@ if analyze_button:
 # Resultado (se guarda en session_state para que no se pierda al recargar)
 if "trayectoria" in st.session_state:
     t = st.session_state.trayectoria
-    puntos = t["puntos"]  # <- este es el vector para el robot: [[x, y], ...]
+    puntos = t["puntos"]      # <- este es el vector para el robot: [[x, y], ...]
+    angulos = t["angulos"]    # <- [ángulo 1, ángulo 2, ángulo 3] en grados, o None
     vector_json = json.dumps(puntos)
 
     st.subheader("Vector de trayectoria")
     st.code(vector_json, language="json")
-    st.download_button("Descargar JSON", vector_json, "trayectoria.json", "application/json")
+
+    if angulos:
+        st.subheader("Ángulos")
+        descripciones = [
+            "Línea 1 respecto a la horizontal",
+            "Entre la línea 1 y la línea 2",
+            "Entre la línea 2 y la línea 3",
+        ]
+        for i, col in enumerate(st.columns(3)):
+            col.metric(f"Ángulo {i + 1}", f"{angulos[i]}°", help=descripciones[i])
+        descarga = json.dumps({"puntos": puntos, "angulos": angulos})
+    else:
+        descarga = vector_json
+    st.download_button("Descargar JSON", descarga, "trayectoria.json", "application/json")
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        st.pyplot(graficar_verificacion(t["imagen"], puntos, t["lado"], t["rango"]))
+        st.pyplot(graficar_verificacion(t["imagen"], puntos, t["lado"], t["rango"], angulos))
     with col2:
         st.dataframe(pd.DataFrame(puntos, columns=["x", "y"]), use_container_width=True)
