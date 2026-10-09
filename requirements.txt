@@ -1,7 +1,8 @@
-streamlit 
+streamlit
+streamlit-drawable-canvas
 openai
-tensorflow 
-matplotlib 
-#streamlit-drawable-canvas 
-streamlit-drawable-canvas== 0.9.2
-#python_version == 3.9
+paho-mqtt
+numpy
+pandas
+matplotlib
+Pillow
